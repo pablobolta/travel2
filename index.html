@@ -15,6 +15,7 @@
     .row { display: flex; gap: 8px; margin: 16px 0; }
     input { flex: 1; padding: 10px; font-size: 16px; }
     button { padding: 10px 14px; font-size: 16px; cursor: pointer; }
+    button[disabled] { opacity: 0.6; cursor: not-allowed; }
     .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
     .heatbar { height: 10px; background: #eee; border-radius: 999px; overflow: hidden; margin-top: 8px; }
     .heatfill { height: 100%; width: 0%; background: #111; transition: width 200ms ease; }
@@ -32,9 +33,43 @@
       border-radius: 10px;
       background: #fff;
     }
-
     @media (max-width: 600px) {
       #map { height: 320px; }
+    }
+
+    /* Gift reveal */
+    .fade-in {
+      animation: fadeInUp 420ms ease-out both;
+    }
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* Confetti layer */
+    #confetti {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+      z-index: 9999;
+      display: none;
+    }
+    .confetti-piece {
+      position: absolute;
+      top: -20px;
+      width: 10px;
+      height: 14px;
+      opacity: 0.95;
+      border-radius: 2px;
+      animation: confettiFall linear forwards;
+      transform: rotate(0deg);
+    }
+    @keyframes confettiFall {
+      to {
+        transform: translateY(110vh) rotate(720deg);
+        opacity: 1;
+      }
     }
   </style>
 </head>
@@ -48,7 +83,6 @@
     Suerte!
   </div>
 
-  <!-- Input + botón (esto faltaba y rompía el JS) -->
   <div class="row">
     <input id="guess" list="countriesList" placeholder="Ej: Japón" autocomplete="off" />
     <button id="btnTry">Probar</button>
@@ -79,10 +113,17 @@
 
   <div class="card">
     <div class="ok">Intentos</div>
+    <div class="small" id="attemptsInfo" style="margin-top:6px;"></div>
     <ul id="attempts"></ul>
-    <button id="btnReset" style="margin-top:10px;">Reiniciar</button>
+    <div class="row" style="margin-top:10px;">
+      <button id="btnReset">Reiniciar</button>
+      <button id="btnNewGame">Nuevo juego</button>
+    </div>
     <div class="small">Se guarda el progreso en este navegador.</div>
   </div>
+
+  <!-- Confetti overlay -->
+  <div id="confetti" aria-hidden="true"></div>
 
   <!-- Leaflet JS -->
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -92,34 +133,52 @@
     "use strict";
 
     // ===================== CONFIG =====================
+    // Cache busting controlado: cambia este ID cuando publiques una nueva versión.
+    const BUILD_ID = "2026-01-09-v2";
+
     // Hungría (Hungary) alpha3 = "HUN"
     // Base64("HUN") = "SFVO"
     const TARGET_ALPHA3_B64 = "SFVO";
-    const STORAGE_KEY = "guess-the-country-v1";
+
+    const MAX_ATTEMPTS = 10;
+
+    // Versiona la key con BUILD_ID para no mezclar partidas entre versiones.
+    const STORAGE_KEY = "guess-the-country-v1:" + BUILD_ID;
     // ==================================================
 
     const $guess = document.getElementById("guess");
     const $btnTry = document.getElementById("btnTry");
     const $btnReset = document.getElementById("btnReset");
+    const $btnNewGame = document.getElementById("btnNewGame");
     const $status = document.getElementById("status");
     const $hint = document.getElementById("hint");
     const $attempts = document.getElementById("attempts");
+    const $attemptsInfo = document.getElementById("attemptsInfo");
     const $list = document.getElementById("countriesList");
     const $heat = document.getElementById("heatfill");
 
     const $giftCard = document.getElementById("giftCard");
     const $btnGift = document.getElementById("btnGift");
     const $giftContent = document.getElementById("giftContent");
+    const $confetti = document.getElementById("confetti");
 
     const TARGET_ALPHA3 = atob(TARGET_ALPHA3_B64).trim().toUpperCase();
 
     let countries = []; // { name, a3, lat, lon }
     let target = null;
-    let attempts = [];  // { name, km, dir }
+    let attempts = [];  // { name, km, dir, a3 }
 
     // ===== MAPA =====
     let map = null;
-    let layerByA3 = new Map(); // alpha3 -> array de layers Leaflet
+    let layerByA3 = new Map();     // alpha3 -> array de layers Leaflet
+    let geoLayer = null;           // capa geojson para resetear estilos
+
+    const BASE_STYLE = {
+      fillColor: "#eee",
+      fillOpacity: 0.55,
+      color: "#999",
+      weight: 1
+    };
 
     function norm(s) {
       return (s || "")
@@ -161,13 +220,19 @@
       $heat.style.width = Math.round(heat01(km) * 100) + "%";
     }
 
+    function updateAttemptsInfo() {
+      const remaining = Math.max(0, MAX_ATTEMPTS - attempts.length);
+      $attemptsInfo.textContent = `Intentos: ${attempts.length}/${MAX_ATTEMPTS} (quedan ${remaining})`;
+    }
+
     function renderAttempts() {
       $attempts.innerHTML = "";
       for (const a of attempts) {
         const li = document.createElement("li");
-        li.textContent = `${a.name} — ${a.km.toFixed(0)} km (${a.dir})`;
+        li.textContent = `${a.name} — ${Number(a.km).toFixed(0)} km (${a.dir})`;
         $attempts.appendChild(li);
       }
+      updateAttemptsInfo();
     }
 
     function save() {
@@ -213,6 +278,18 @@
       return guessCountry.a3 === target.a3;
     }
 
+    function lockGame(message, hintText) {
+      $status.textContent = message;
+      $hint.textContent = hintText || "";
+      $guess.disabled = true;
+      $btnTry.disabled = true;
+    }
+
+    function unlockGame() {
+      $guess.disabled = false;
+      $btnTry.disabled = false;
+    }
+
     // ===== MAP HELPERS =====
     function heatColor(km) {
       const max = 8000;
@@ -234,6 +311,23 @@
       for (const lyr of layers) lyr.setStyle(style);
     }
 
+    function highlightTarget(a3) {
+      const layers = layerByA3.get(a3);
+      if (!layers) return;
+
+      const style = {
+        fillColor: "hsl(45, 95%, 55%)", // dorado
+        fillOpacity: 0.92,
+        color: "#222",
+        weight: 2
+      };
+      for (const lyr of layers) lyr.setStyle(style);
+    }
+
+    function resetMapStyles() {
+      if (geoLayer) geoLayer.setStyle(BASE_STYLE);
+    }
+
     function getA3FromFeatureProps(props) {
       if (!props) return "";
       return (
@@ -247,7 +341,6 @@
     }
 
     async function initMap() {
-      // Evita re-crear mapa si ya existe (por seguridad)
       if (map) return;
 
       map = L.map("map", {
@@ -257,20 +350,15 @@
         maxZoom: 6
       }).setView([20, 0], 2);
 
-      const url = "./world.geojson?v=" + Date.now();
+      const url = "./world.geojson?v=" + encodeURIComponent(BUILD_ID);
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status + " al cargar " + url + " (sube world.geojson a la raíz)");
 
       const gj = await res.json();
       layerByA3 = new Map();
 
-      L.geoJSON(gj, {
-        style: () => ({
-          fillColor: "#eee",
-          fillOpacity: 0.55,
-          color: "#999",
-          weight: 1
-        }),
+      geoLayer = L.geoJSON(gj, {
+        style: () => ({ ...BASE_STYLE }),
         onEachFeature: (feature, layer) => {
           const a3 = getA3FromFeatureProps(feature && feature.properties ? feature.properties : {});
           if (!a3) return;
@@ -281,11 +369,48 @@
       }).addTo(map);
     }
 
+    // ===== CONFETTI =====
+    function startConfetti(durationMs = 1400) {
+      $confetti.innerHTML = "";
+      $confetti.style.display = "block";
+
+      const pieces = 60;
+      for (let i = 0; i < pieces; i++) {
+        const el = document.createElement("div");
+        el.className = "confetti-piece";
+
+        const left = Math.random() * 100;
+        const delay = Math.random() * 0.25;
+        const dur = 0.9 + Math.random() * 0.9;
+
+        // Colores variados (sin depender de librerías)
+        const hue = Math.floor(Math.random() * 360);
+        el.style.background = `hsl(${hue}, 85%, 55%)`;
+
+        el.style.left = left + "vw";
+        el.style.animationDuration = dur + "s";
+        el.style.animationDelay = delay + "s";
+
+        // tamaños variados
+        const w = 6 + Math.floor(Math.random() * 8);
+        const h = 8 + Math.floor(Math.random() * 12);
+        el.style.width = w + "px";
+        el.style.height = h + "px";
+
+        $confetti.appendChild(el);
+      }
+
+      window.setTimeout(() => {
+        $confetti.style.display = "none";
+        $confetti.innerHTML = "";
+      }, durationMs);
+    }
+
     async function init() {
       $status.textContent = "Descargando países…";
       $hint.textContent = "";
 
-      const url = "./countries.json?v=" + Date.now();
+      const url = "./countries.json?v=" + encodeURIComponent(BUILD_ID);
       const res = await fetch(url, { cache: "no-store" });
       if (!res.ok) throw new Error("HTTP " + res.status + " al cargar " + url);
 
@@ -359,20 +484,33 @@
       $giftContent.style.display = "none";
       $btnGift.disabled = false;
 
-      if (attempts.length === 0) {
-        $status.textContent = "Listo. Empieza a probar países.";
-        $hint.textContent = "Te diré distancia aproximada y dirección.";
-        setHeat(8000);
-      } else {
-        const last = attempts[attempts.length - 1];
-        $status.textContent = "Partida cargada. Sigue.";
-        $hint.textContent = `Último intento: ${last.km.toFixed(0)} km (${last.dir}).`;
-        setHeat(last.km);
+      // Repintar mapa con intentos cargados (si existen)
+      resetMapStyles();
+      for (const a of attempts) {
+        if (a && a.a3 && typeof a.km === "number") {
+          paintCountry(a.a3, a.km);
+        }
       }
+
+      // Si se han agotado intentos en carga
+      if (attempts.length >= MAX_ATTEMPTS) {
+        lockGame("Se acabaron los intentos.", "Pulsa Reiniciar o Nuevo juego.");
+        return;
+      }
+
+      $status.textContent = "Listo. Empieza a probar países.";
+      $hint.textContent = "Te diré distancia aproximada y dirección.";
+      setHeat(8000);
+      $guess.focus();
     }
 
     function onTry() {
       if (!target || countries.length === 0) return;
+
+      if (attempts.length >= MAX_ATTEMPTS) {
+        lockGame("Se acabaron los intentos.", "Pulsa Reiniciar o Nuevo juego.");
+        return;
+      }
 
       const input = $guess.value;
       const g = findCountryByName(input);
@@ -392,7 +530,7 @@
 
       paintCountry(g.a3, km);
 
-      attempts.push({ name: g.name, km, dir });
+      attempts.push({ name: g.name, km, dir, a3: g.a3 });
       save();
       renderAttempts();
       setHeat(km);
@@ -407,9 +545,15 @@
 
         $guess.disabled = true;
         $btnTry.disabled = true;
+        return;
+      }
+
+      const remaining = MAX_ATTEMPTS - attempts.length;
+      if (remaining <= 0) {
+        lockGame("Se acabaron los intentos.", "Pulsa Reiniciar o Nuevo juego.");
       } else {
         $status.textContent = "Aún no. Sigue.";
-        $hint.textContent = `${km.toFixed(0)} km (${dir}).`;
+        $hint.textContent = `${km.toFixed(0)} km (${dir}). Te quedan ${remaining} intentos.`;
         $guess.value = "";
         $guess.focus();
       }
@@ -420,25 +564,42 @@
       save();
       renderAttempts();
 
-      $guess.disabled = false;
-      $btnTry.disabled = false;
+      unlockGame();
+      $guess.value = "";
+      $guess.focus();
 
       $status.textContent = "Reiniciado. Empieza a probar países.";
       $hint.textContent = "";
       setHeat(8000);
 
+      // Reset visual del mapa
+      resetMapStyles();
+
+      // Ocultar regalo
       $giftCard.style.display = "none";
       $giftContent.style.display = "none";
       $btnGift.disabled = false;
     }
 
+    function onNewGame() {
+      // Limpia la partida y recarga: forma más fiable
+      localStorage.removeItem(STORAGE_KEY);
+      location.reload();
+    }
+
     // Botón del regalo
     $btnGift.addEventListener("click", () => {
       $giftContent.style.display = "block";
+      $giftContent.classList.remove("fade-in");
+      // reflow para reiniciar animación
+      void $giftContent.offsetWidth;
+      $giftContent.classList.add("fade-in");
+
       $btnGift.disabled = true;
 
-      // Resalta el destino (máximo caliente)
-      paintCountry(TARGET_ALPHA3, 0);
+      // Confetti + resaltar el destino SOLO aquí
+      startConfetti(1500);
+      highlightTarget(TARGET_ALPHA3);
 
       // Zoom al destino si existe layer
       const layers = layerByA3.get(TARGET_ALPHA3);
@@ -450,6 +611,7 @@
     $btnTry.addEventListener("click", onTry);
     $guess.addEventListener("keydown", (e) => { if (e.key === "Enter") onTry(); });
     $btnReset.addEventListener("click", onReset);
+    $btnNewGame.addEventListener("click", onNewGame);
 
     init().catch(err => {
       $status.textContent = "Error cargando el juego: " + (err && err.message ? err.message : String(err));
@@ -460,4 +622,3 @@
   </script>
 </body>
 </html>
-
